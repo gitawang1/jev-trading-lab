@@ -14,7 +14,7 @@ integration.
 3. Uses `curl` to send a hard-coded fictional PENGU state to `typesafe-ai/jev`.
 4. Asks Jev one native choice question (`action`), two native boolean questions
    (`trendConfirmed` and `volumeConfirmed`), and one native score question
-   (`setupQuality`, on Jev's native 0–10 rubric).
+   (`setupQuality`, on a ten-level native 0–9 rubric).
 5. Exposes that fourth answer to the application as `entryQuality`, normalized
    to a 0–100 scale.
 6. Prints only whether a response arrived, its status, the structured result, a
@@ -23,8 +23,8 @@ integration.
 
 Jev's native boolean answers are probabilities. This proof of concept converts
 each to a JavaScript boolean using `probability >= 0.5`. Jev's score can be
-fractional within the 0–10 rubric, so `entryQuality` is calculated by multiplying
-the validated native score by 10.
+fractional within the 0–9 rubric, so `entryQuality` is normalized with
+`score / 9 * 100` after validating the native score.
 
 ## Why this uses curl
 
@@ -41,19 +41,24 @@ credential, use a private temporary directory, and are removed after the run.
 
 ## API format verified
 
-The request follows the current Vercel AI SDK v4 Gateway evaluation transport:
+The request follows Vercel's current official native Jev HTTP API:
 
-- `POST https://ai-gateway.vercel.sh/v4/ai/evaluation-model`
+- `POST https://ai-gateway.vercel.sh/v1/evaluate`
 - `Authorization: Bearer <AI_GATEWAY_API_KEY>`
-- `ai-evaluation-model-specification-version: 4`
-- `ai-model-id: typesafe-ai/jev`
-- JSON body: `{ "state": ..., "questions": ... }`
+- `Content-Type: application/json`
+- JSON body: `{ "model": "typesafe-ai/jev", "state": ..., "questions": ... }`
 
-This was checked against Vercel's current
-[Gateway evaluation implementation](https://github.com/vercel/ai/blob/main/packages/gateway/src/gateway-evaluation-model.ts),
-[evaluation documentation](https://github.com/vercel/ai/blob/main/content/docs/03-ai-sdk-core/32-evaluation.mdx),
-and the Gateway's live `/v1/models` catalog. The model catalog identifies
-`typesafe-ai/jev` as an evaluation model supporting specification v4.
+This endpoint and the three-field request schema were checked against Vercel's
+current official AI Gateway documentation. The question shapes also follow
+Vercel's official [evaluation documentation](https://ai-sdk.dev/docs/ai-sdk-core/evaluation):
+choice criteria are a named map, score criteria are ordered levels, and boolean
+questions require no criteria.
+
+Validate the complete request locally, without a credential or network request:
+
+```bash
+npm run validate:request
+```
 
 ## Secure Setup-phase run
 
