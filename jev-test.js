@@ -4,84 +4,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const API_URL = 'https://ai-gateway.vercel.sh/v1/evaluate';
-const MODEL = 'typesafe-ai/jev';
 const CURL_TIMEOUT_SECONDS = 30;
-const SCORE_MAX = 9;
 
-const marketState = {
-  dataClassification: 'FICTIONAL TEST DATA',
-  symbol: 'PENGU',
-  price: 0.0318,
-  crsi_3_2_100: 71.4,
-  vwap: 0.0309,
-  poc: 0.0304,
-  relativeVolume: 1.82,
-  fiveMinuteSwingHigh: 0.0322,
-  priceAboveVwap: true,
-  oneHourTrend: 'UP',
-  fourHourTrend: 'UP',
-};
-
-const questions = {
-  action: {
-    type: 'choice',
-    instructions:
-      'Select the single best non-executing observation status for this fictional setup.',
-    criteria: {
-      WATCH: 'Interesting, but conditions need more development.',
-      READY: 'Conditions are strong and near a hypothetical trigger, but do not enter.',
-      ENTER: 'All supplied fictional conditions support a hypothetical entry now.',
-      AVOID: 'Conditions are conflicting or unsuitable.',
+// This is deliberately the smallest request shown by Vercel for a native Jev
+// evaluation. Keep it small until the secure Setup-phase diagnostic succeeds.
+const request = {
+  model: 'typesafe-ai/jev',
+  state: 'The support agent issued a full refund to the customer.',
+  questions: {
+    refunded: {
+      type: 'boolean',
+      instructions: 'Was a refund issued?',
     },
   },
-  trendConfirmed: {
-    type: 'boolean',
-    instructions:
-      'Are the supplied 1-hour and 4-hour trends aligned bullishly and confirmed by price above VWAP?',
-  },
-  volumeConfirmed: {
-    type: 'boolean',
-    instructions:
-      'Does the supplied relative volume confirm meaningful above-normal participation?',
-  },
-  setupQuality: {
-    type: 'score',
-    instructions:
-      'Score the overall quality of this fictional setup from 0 (worst) through 9 (best).',
-    criteria: Array.from({ length: SCORE_MAX + 1 }, (_, score) => `${score}/${SCORE_MAX}`),
-  },
 };
 
-const request = { model: MODEL, state: marketState, questions };
-
 function validateRequest(payload) {
-  if (
-    payload?.model !== MODEL ||
-    payload?.state?.dataClassification !== 'FICTIONAL TEST DATA' ||
-    payload?.state?.symbol !== 'PENGU' ||
-    !payload?.questions ||
-    Object.keys(payload.questions).length !== 4
-  ) {
-    throw new Error('The Jev request does not match the expected schema.');
+  const expected = JSON.stringify(request);
+  if (JSON.stringify(payload) !== expected) {
+    throw new Error('The Jev request does not match the documented minimal schema.');
   }
 
-  const { action, trendConfirmed, volumeConfirmed, setupQuality } =
-    payload.questions;
-  if (
-    action?.type !== 'choice' ||
-    JSON.stringify(Object.keys(action.criteria ?? {})) !==
-      JSON.stringify(['WATCH', 'READY', 'ENTER', 'AVOID']) ||
-    trendConfirmed?.type !== 'boolean' ||
-    volumeConfirmed?.type !== 'boolean' ||
-    setupQuality?.type !== 'score' ||
-    !Array.isArray(setupQuality.criteria) ||
-    setupQuality.criteria.length !== SCORE_MAX + 1
-  ) {
-    throw new Error('The Jev questions do not match the expected schema.');
-  }
-
-  // Ensure the exact object sent over HTTP is JSON-compatible.
-  JSON.parse(JSON.stringify(payload));
+  JSON.parse(expected);
 }
 
 function requireApiKey() {
@@ -91,37 +35,21 @@ function requireApiKey() {
       'AI_GATEWAY_API_KEY is unavailable. Set it in the environment and retry.',
     );
   }
-  if (!/^[A-Za-z0-9._~-]+$/.test(apiKey)) {
-    throw new Error('AI_GATEWAY_API_KEY has an invalid format.');
-  }
   return apiKey;
 }
 
-function formatAnswers(payload) {
-  const answers = payload?.answers;
+function formatAnswer(payload) {
+  const probability = payload?.answers?.refunded?.probability;
   if (
-    !answers ||
-    typeof answers.action?.choice !== 'string' ||
-    typeof answers.trendConfirmed?.probability !== 'number' ||
-    typeof answers.volumeConfirmed?.probability !== 'number' ||
-    typeof answers.setupQuality?.score !== 'number' ||
-    answers.setupQuality.score < 0 ||
-    answers.setupQuality.score > SCORE_MAX ||
-    !['WATCH', 'READY', 'ENTER', 'AVOID'].includes(answers.action.choice) ||
-    answers.trendConfirmed.probability < 0 ||
-    answers.trendConfirmed.probability > 1 ||
-    answers.volumeConfirmed.probability < 0 ||
-    answers.volumeConfirmed.probability > 1
+    typeof probability !== 'number' ||
+    !Number.isFinite(probability) ||
+    probability < 0 ||
+    probability > 1
   ) {
     throw new Error('The gateway returned an unexpected response shape.');
   }
 
-  return {
-    action: answers.action.choice,
-    trendConfirmed: answers.trendConfirmed.probability >= 0.5,
-    volumeConfirmed: answers.volumeConfirmed.probability >= 0.5,
-    entryQuality: (answers.setupQuality.score / SCORE_MAX) * 100,
-  };
+  return { refunded: probability >= 0.5, probability };
 }
 
 function runCurl(apiKey, requestPath, responsePath) {
@@ -169,12 +97,60 @@ function printHttpResult(received, status) {
   console.log(`HTTP status: ${status ?? 'unavailable'}`);
 }
 
+const SENSITIVE_TEXT =
+  /authorization|proxy-authorization|api[-_ ]?key|credential|cookie|set-cookie|(?:bearer|basic)\s+\S+|secret|token/i;
+const SAFE_ERROR_KEYS = new Set(['type', 'code', 'message']);
+
+function sanitizeVercelError(rawBody) {
+  if (!rawBody || rawBody.length > 64_000 || SENSITIVE_TEXT.test(rawBody)) {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    return null;
+  }
+
+  const source =
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed.error && typeof parsed.error === 'object' && !Array.isArray(parsed.error)
+        ? parsed.error
+        : parsed
+      : null;
+  if (!source) return null;
+
+  const safe = {};
+  for (const key of SAFE_ERROR_KEYS) {
+    if (typeof source[key] === 'string' && !SENSITIVE_TEXT.test(source[key])) {
+      safe[key] = source[key];
+    }
+  }
+  return Object.keys(safe).length > 0 ? safe : null;
+}
+
+async function reportHttpError(responsePath, status) {
+  let safeError = null;
+  try {
+    safeError = sanitizeVercelError(await readFile(responsePath, 'utf8'));
+  } catch {
+    // A missing/unreadable response has nothing safe to report.
+  }
+
+  console.error(`API error: Vercel AI Gateway returned HTTP ${status}.`);
+  if (safeError) {
+    console.error(`Sanitized Vercel error: ${JSON.stringify(safeError)}`);
+  } else {
+    console.error('Vercel error body withheld because it could not be proven safe.');
+  }
+}
+
 async function main() {
   validateRequest(request);
   if (process.argv.includes('--validate-request')) {
-    console.log(
-      `Valid Jev request: POST ${API_URL} with JSON fields model, state, and questions.`,
-    );
+    console.log(JSON.stringify(request, null, 2));
+    console.log(`Valid minimal Jev request for POST ${API_URL}.`);
     return;
   }
 
@@ -193,9 +169,7 @@ async function main() {
   const responsePath = join(directory, 'response.json');
 
   try {
-    await writeFile(requestPath, JSON.stringify(request), {
-      mode: 0o600,
-    });
+    await writeFile(requestPath, JSON.stringify(request), { mode: 0o600 });
     const result = await runCurl(apiKey, requestPath, responsePath);
     const status = /^\d{3}$/.test(result.statusOutput)
       ? Number(result.statusOutput)
@@ -207,7 +181,9 @@ async function main() {
       throw new Error(`curl transport failed (exit ${result.code ?? 'unknown'}).`);
     }
     if (status < 200 || status >= 300) {
-      throw new Error(`Vercel AI Gateway returned HTTP ${status}.`);
+      await reportHttpError(responsePath, status);
+      process.exitCode = 1;
+      return;
     }
 
     let payload;
@@ -216,12 +192,8 @@ async function main() {
     } catch {
       throw new Error('The gateway returned invalid JSON.');
     }
-    const evaluation = formatAnswers(payload);
     console.log('Structured Jev evaluation:');
-    console.log(JSON.stringify(evaluation, null, 2));
-    console.log(
-      `Summary: ${evaluation.action}; trend ${evaluation.trendConfirmed ? 'confirmed' : 'not confirmed'}, volume ${evaluation.volumeConfirmed ? 'confirmed' : 'not confirmed'}, entry quality ${evaluation.entryQuality}/100.`,
-    );
+    console.log(JSON.stringify(formatAnswer(payload), null, 2));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
