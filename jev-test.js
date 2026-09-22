@@ -97,12 +97,12 @@ function printHttpResult(received, status) {
   console.log(`HTTP status: ${status ?? 'unavailable'}`);
 }
 
-const SENSITIVE_TEXT =
-  /authorization|proxy-authorization|api[-_ ]?key|credential|cookie|set-cookie|(?:bearer|basic)\s+\S+|secret|token/i;
-const SAFE_ERROR_KEYS = new Set(['type', 'code', 'message']);
+const SAFE_ERROR_KEYS = ['type', 'code', 'message'];
+const CREDENTIAL_VALUE =
+  /(?:authorization|proxy-authorization|api[-_ ]?key|credential)\s*[:=]\s*\S+|(?:bearer|basic)\s+\S+/i;
 
 function sanitizeVercelError(rawBody) {
-  if (!rawBody || rawBody.length > 64_000 || SENSITIVE_TEXT.test(rawBody)) {
+  if (!rawBody || rawBody.length > 64_000) {
     return null;
   }
 
@@ -113,21 +113,32 @@ function sanitizeVercelError(rawBody) {
     return null;
   }
 
-  const source =
-    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed.error && typeof parsed.error === 'object' && !Array.isArray(parsed.error)
-        ? parsed.error
-        : parsed
-      : null;
-  if (!source) return null;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
 
-  const safe = {};
-  for (const key of SAFE_ERROR_KEYS) {
-    if (typeof source[key] === 'string' && !SENSITIVE_TEXT.test(source[key])) {
-      safe[key] = source[key];
+  const fields = [];
+  const sources = [
+    ['error', parsed.error],
+    [null, parsed],
+  ];
+  for (const [prefix, source] of sources) {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) continue;
+
+    for (const key of SAFE_ERROR_KEYS) {
+      if (!Object.hasOwn(source, key)) continue;
+      const value = source[key];
+      const isSafeScalar =
+        value === null ||
+        typeof value === 'boolean' ||
+        (typeof value === 'number' && Number.isFinite(value)) ||
+        (typeof value === 'string' && !CREDENTIAL_VALUE.test(value));
+      if (isSafeScalar) {
+        fields.push([prefix ? `${prefix}.${key}` : key, value]);
+      }
     }
   }
-  return Object.keys(safe).length > 0 ? safe : null;
+  return fields.length > 0 ? fields : null;
 }
 
 async function reportHttpError(responsePath, status) {
@@ -140,9 +151,11 @@ async function reportHttpError(responsePath, status) {
 
   console.error(`API error: Vercel AI Gateway returned HTTP ${status}.`);
   if (safeError) {
-    console.error(`Sanitized Vercel error: ${JSON.stringify(safeError)}`);
+    for (const [field, value] of safeError) {
+      console.error(`${field}: ${JSON.stringify(value)}`);
+    }
   } else {
-    console.error('Vercel error body withheld because it could not be proven safe.');
+    console.error('Vercel returned no safely displayable error detail.');
   }
 }
 

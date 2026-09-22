@@ -63,9 +63,9 @@ Request and response files are placed in a private temporary directory and
 removed after the run. Curl diagnostics and request headers are never printed.
 
 For a non-2xx response, the script parses the response only as JSON and emits
-only allowlisted string fields (`type`, `code`, and `message`). It withholds the
-entire body if it is not JSON, is unexpectedly large, contains a sensitive
-marker, or has no allowlisted error field. It never prints the raw response.
+only safe scalar values from the allowlisted `error.type`, `error.code`,
+`error.message`, `type`, `code`, and `message` fields. If none are safely
+displayable, it reports that fact without printing the raw response.
 
 ## Secure Setup-phase run
 
