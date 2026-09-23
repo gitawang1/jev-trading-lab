@@ -5,7 +5,7 @@
   "description": "Minimal Jev evaluation proof of concept using fictional market data",
   "type": "module",
   "scripts": {
-    "validate:request": "node jev-test.js --validate-request",
+    "validate": "node jev-test.js --validate",
     "test:jev": "node jev-test.js"
   },
   "engines": {
