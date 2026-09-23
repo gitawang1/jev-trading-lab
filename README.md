@@ -64,6 +64,64 @@ npm run validate
 
 Offline validation checks the PENGU request, all five Noul outputs, latency formatting, and sanitized error formatting without reading a credential or sending a network request.
 
+## Offline historical validation
+
+The historical validator is deliberately local-only. Its defaults model NVDA and
+other US equities with the IANA timezone `America/New_York`:
+
+- regular session: `09:30-16:00 America/New_York`;
+- extended session: `04:00-20:00 America/New_York`.
+
+Session membership is never determined from UTC wall-clock values. An input
+timestamp with `Z` or a numeric offset identifies an instant directly. An input
+without an offset is interpreted in `--input-timezone` (default `UTC`). That
+normalized instant is then converted through `Intl`'s IANA timezone data into
+`--exchange-timezone` (default `America/New_York`) before it is compared with
+the selected session. Consequently, the New York open remains 09:30 across
+historical EST/EDT offset changes.
+
+Input is a JSON array whose records contain `timestamp` and numeric `volume`:
+
+```bash
+node historical-validation.js \
+  --input bars.json \
+  --input-timezone UTC \
+  --exchange-timezone America/New_York \
+  --session regular \
+  --bar-timestamp open \
+  --bar-minutes 5
+```
+
+Session bounds are start-inclusive and end-exclusive. With
+`--bar-timestamp open`, the timestamp is the opening instant of a bar. With
+`--bar-timestamp close`, the validator subtracts `--bar-minutes` to classify
+the bar by its opening instant; therefore a five-minute bar stamped `16:00`
+belongs to the regular session, while one stamped `09:30` does not.
+
+The relative-volume value remains the **same-session rolling 20-bar relative-volume
+proxy**: current volume divided by the mean of the preceding 20 eligible bars
+from the same exchange-local date. It is not a time-of-day-normalized RVOL.
+For five-minute bars in regular-session mode, the proxy imposes an approximately
+100-minute opening-session warm-up before an observation can become eligible.
+A future, separately named time-of-day-normalized RVOL variant may be needed to
+evaluate opening-session setups without that warm-up; this repository does not
+implement that alternative.
+
+The validator does **not** invent an exchange calendar. Weekends, exchange
+holidays, unscheduled closures, and early closes are not modeled. Input data
+must be filtered appropriately until the historical market-data provider and
+its calendar semantics are selected.
+
+Run the deterministic offline checks (including dates before and after both US
+daylight-saving transitions) with:
+
+```bash
+npm run validate:historical
+```
+
+See [`HISTORICAL_VALIDATION_REPORT.md`](HISTORICAL_VALIDATION_REPORT.md) for the
+methodology and remaining assumptions.
+
 ## Secure Setup-phase run
 
 The authenticated command is intended only for secure Setup in a fresh environment:

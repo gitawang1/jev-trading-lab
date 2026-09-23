@@ -10,7 +10,8 @@
     "validate:benchmark": "node jev-benchmark.js --validate",
     "benchmark:jev": "node jev-benchmark.js",
     "validate:sensitivity": "node jev-sensitivity.js --validate",
-    "sensitivity:jev": "node jev-sensitivity.js"
+    "sensitivity:jev": "node jev-sensitivity.js",
+    "validate:historical": "node historical-validation.js --validate"
   },
   "engines": {
     "node": ">=20"
