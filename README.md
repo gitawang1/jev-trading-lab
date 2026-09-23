@@ -82,3 +82,28 @@ The only retained authenticated-run artifact is `/tmp/typesafe-jev-test-result.t
 ```text
 Vercel returned no safely displayable error detail.
 ```
+
+
+## Controlled repeatability benchmark
+
+`jev-benchmark.js` reuses the exact same fictional PENGU state, `jev-latest` model, TypeSafe-compatible endpoint, five Noul questions, curl timing boundary, and credential handling as the single-request diagnostic.
+
+Offline validation makes no authenticated request:
+
+```bash
+npm run validate:benchmark
+```
+
+The real benchmark is deliberately separate from Setup's single-request health check:
+
+```bash
+npm run benchmark:jev
+```
+
+**The real benchmark makes exactly 10 authenticated Jev requests, sequentially.** Each request is timed independently with `process.hrtime.bigint()`. Per-run output records sanitized status, latency, and the five Noul values. Failed requests are recorded with allowlisted safe error details and the remaining runs continue.
+
+Successful runs are summarized with latency minimum, maximum, mean, median, and nearest-rank P95. For 10 successful runs, nearest-rank P95 selects rank `ceil(0.95 × 10) = 10`, the slowest observation. Each Noul is summarized with minimum, maximum, mean, median, population standard deviation, and range (`max - min`).
+
+Before an authenticated benchmark, any old `/tmp/typesafe-jev-benchmark-result.txt` is removed. The sanitized benchmark artifact is written atomically with mode `0600`. Raw request/response bodies, authorization headers, API keys, and proxy credentials are never included in the artifact. Each run uses a private temporary directory that is removed in `finally`; the API key is passed to curl via stdin configuration and removed from curl's child environment.
+
+This benchmark evaluates model repeatability only. It is paper-trading/model-evaluation infrastructure and does not produce BUY, SELL, ENTER, EXIT, position-size, stop-loss, broker, exchange, wallet, or live-market actions.
