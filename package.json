@@ -8,7 +8,9 @@
     "validate": "node jev-test.js --validate",
     "test:jev": "node jev-test.js",
     "validate:benchmark": "node jev-benchmark.js --validate",
-    "benchmark:jev": "node jev-benchmark.js"
+    "benchmark:jev": "node jev-benchmark.js",
+    "validate:sensitivity": "node jev-sensitivity.js --validate",
+    "sensitivity:jev": "node jev-sensitivity.js"
   },
   "engines": {
     "node": ">=20"

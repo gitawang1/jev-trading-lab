@@ -107,3 +107,24 @@ Successful runs are summarized with latency minimum, maximum, mean, median, and 
 Before an authenticated benchmark, any old `/tmp/typesafe-jev-benchmark-result.txt` is removed. The sanitized benchmark artifact is written atomically with mode `0600`. Raw request/response bodies, authorization headers, API keys, and proxy credentials are never included in the artifact. Each run uses a private temporary directory that is removed in `finally`; the API key is passed to curl via stdin configuration and removed from curl's child environment.
 
 This benchmark evaluates model repeatability only. It is paper-trading/model-evaluation infrastructure and does not produce BUY, SELL, ENTER, EXIT, position-size, stop-loss, broker, exchange, wallet, or live-market actions.
+
+
+## Synthetic sensitivity test
+
+`jev-sensitivity.js` evaluates 10 fictional scenarios sequentially: the unchanged PENGU baseline plus nine one-variable perturbations. The five original Noul questions and `jev-latest` model are unchanged. Scenarios test CRSI 78, relative volume 0.7, below VWAP, no 5-minute swing-high breakout, bearish 1-hour trend, bullish 4-hour trend, 4.0% distance from VWAP, relative volume 2.5, and CRSI 25.
+
+Offline validation:
+
+```bash
+npm run validate:sensitivity
+```
+
+Authenticated sensitivity run:
+
+```bash
+npm run sensitivity:jev
+```
+
+The authenticated command makes exactly 10 sequential Jev requests and writes the sanitized artifact to `/tmp/typesafe-jev-sensitivity-result.txt`. It reports all five Noul values for each scenario and each value's delta versus the baseline. Predeclared directional hypotheses are reported as `satisfied`, `not_satisfied`, or `unchanged`; the CRSI-25 scenario is deliberately exploratory.
+
+The hypotheses are diagnostic expectations, not trading rules or order instructions. Security handling matches the other authenticated diagnostics: the API key is passed to curl through stdin config rather than argv, removed from curl's child environment, raw request/response files are private and deleted, and only sanitized results persist.
