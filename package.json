@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "validate": "node jev-test.js --validate",
-    "test:jev": "node jev-test.js"
+    "test:jev": "node jev-test.js",
+    "validate:benchmark": "node jev-benchmark.js --validate",
+    "benchmark:jev": "node jev-benchmark.js"
   },
   "engines": {
     "node": ">=20"
