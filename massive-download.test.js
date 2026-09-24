@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { API_ORIGIN, calendarChunks, collectChunk, curlRequest, downloadArchive, initialUrl, requestWithRetry, sha256, validateArchive } from './massive-download.js';
 
-const row = (t, extra = {}) => ({ t, o: 1, h: 2, l: 0.5, c: 1.5, v: 0.125, ...extra });
+const row = (minute, extra = {}) => ({ t: minute * 60_000, o: 1, h: 2, l: 0.5, c: 1.5, v: 0.125, ...extra });
 const response = (results, next_url) => ({ status: 200, body: JSON.stringify({ results, next_url }) });
 
 test('calendar chunks are deterministic seven-calendar-day inclusive ranges', () => {
@@ -115,4 +115,64 @@ test('fractional volume and provider fields survive the persisted archive', asyn
   const manifest = await downloadArchive({ symbol: 'NVDA', from: '2024-01-01', to: '2024-01-01', directory, intervalMs: 0, request: async () => response([wanted]) });
   const stored = JSON.parse(await readFile(join(directory, manifest.chunks[0].file), 'utf8'));
   assert.deepEqual(stored.results[0], wanted);
+});
+
+test('mixed retryable failures succeed within the retry budget', async () => {
+  const sequence = [{ status: 429, body: '' }, new Error('network'), { status: 503, body: '' }, response([])];
+  let calls = 0;
+  const result = await requestWithRetry('x', { intervalMs: 0, maxRetries: 3, request: async () => { const value = sequence[calls++]; if (value instanceof Error) throw value; return value; } });
+  assert.deepEqual(result.results, []); assert.equal(calls, 4);
+});
+
+test('mixed retryable failures stop after five total attempts when maxRetries is four', async () => {
+  const sequence = [{ status: 429, body: '' }, { status: 503, body: '' }, new Error('network'), { status: 500, body: '' }, { status: 429, body: '' }];
+  let calls = 0;
+  await assert.rejects(requestWithRetry('x', { intervalMs: 0, maxRetries: 4, request: async () => { const value = sequence[calls++]; if (value instanceof Error) throw value; return value; } }), /Retry limit/);
+  assert.equal(calls, 5);
+});
+
+test('permanent 400 and malformed successful JSON each fail after one attempt', async () => {
+  for (const reply of [{ status: 400, body: '' }, { status: 200, body: '{bad' }]) {
+    let calls = 0;
+    await assert.rejects(requestWithRetry('x', { intervalMs: 0, maxRetries: 4, request: async () => { calls++; return reply; } }), /Permanent HTTP 400|Malformed JSON/);
+    assert.equal(calls, 1);
+  }
+});
+
+test('provider row validation rejects bad alignment, negative volume, OHLC, n, and otc', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'massive-invalid-'));
+  const badRows = [
+    row(1, { t: 60_001 }),
+    row(1, { v: -1 }),
+    row(1, { h: 0.25 }),
+    row(1, { n: -1 }),
+    row(1, { otc: 'false' }),
+  ];
+  for (const bad of badRows) {
+    await assert.rejects(downloadArchive({ symbol: 'NVDA', from: '2024-01-01', to: '2024-01-01', directory, intervalMs: 0, request: async () => response([bad]) }));
+  }
+});
+
+test('provider envelope rejects mismatched ticker and unadjusted data', async () => {
+  for (const page of [
+    { status: 200, body: JSON.stringify({ ticker: 'AMD', adjusted: true, results: [] }) },
+    { status: 200, body: JSON.stringify({ ticker: 'NVDA', adjusted: false, results: [] }) },
+  ]) {
+    await assert.rejects(collectChunk(`${API_ORIGIN}/x`, { symbol: 'NVDA', intervalMs: 0, request: async () => page }), /Ticker mismatch|not adjusted/);
+  }
+});
+
+test('resume does not trust checksum-matching but structurally invalid stored content', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'massive-structural-resume-')); let calls = 0;
+  const options = { symbol: 'NVDA', from: '2024-01-01', to: '2024-01-01', directory, intervalMs: 0, request: async () => { calls++; return response([row(1)]); } };
+  const first = await downloadArchive(options);
+  const path = join(directory, first.chunks[0].file);
+  const invalid = Buffer.from(JSON.stringify({ ticker: 'NVDA', adjusted: true, results: [row(1, { v: -1 })] }) + '\n');
+  await writeFile(path, invalid);
+  const manifestPath = join(directory, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  manifest.chunks[0].sha256 = sha256(invalid); manifest.chunks[0].rowCount = 1;
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  await downloadArchive({ ...options, resume: true });
+  assert.equal(calls, 2);
 });

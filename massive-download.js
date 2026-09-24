@@ -61,24 +61,38 @@ export function curlRequest(url, apiKey, { spawnImpl = spawn } = {}) {
 }
 
 export async function requestWithRetry(url, { request, wait = sleep, intervalMs = DEFAULT_INTERVAL_MS, maxRetries = DEFAULT_MAX_RETRIES, onRequest = () => {} }) {
-  let attempt = 0;
-  while (true) {
+  const maxAttempts = maxRetries + 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (intervalMs) await wait(intervalMs);
     onRequest(url, attempt);
+    let response;
     try {
-      const response = await request(url);
-      if (response.status === 401 || response.status === 403) throw Object.assign(new Error(`Permanent authentication failure (HTTP ${response.status}).`), { permanent: true });
-      if (response.status === 429 || response.status >= 500) {
-        if (attempt++ < maxRetries) continue;
-        throw new Error(`Retry limit exhausted after HTTP ${response.status}.`);
-      }
-      if (response.status < 200 || response.status >= 300) throw Object.assign(new Error(`Permanent HTTP ${response.status}.`), { permanent: true });
-      return JSON.parse(response.body);
+      response = await request(url);
     } catch (error) {
-      if (error.permanent || error instanceof SyntaxError) throw error;
-      if (attempt++ >= maxRetries) throw new Error(`Retry limit exhausted after network failure: ${error.message}`);
+      if (attempt + 1 >= maxAttempts) throw new Error(`Retry limit exhausted after network failure: ${error.message}`);
+      continue;
+    }
+    if (response.status === 401 || response.status === 403) throw new Error(`Permanent authentication failure (HTTP ${response.status}).`);
+    if (response.status === 429 || (response.status >= 500 && response.status <= 599)) {
+      if (attempt + 1 >= maxAttempts) throw new Error(`Retry limit exhausted after HTTP ${response.status}.`);
+      continue;
+    }
+    if (response.status < 200 || response.status >= 300) throw new Error(`Permanent HTTP ${response.status}.`);
+    try {
+      return JSON.parse(response.body);
+    } catch {
+      throw new Error('Malformed JSON in successful Massive response.');
     }
   }
+  throw new Error('Retry limit exhausted.');
+}
+
+function validateEnvelope(page, expectedSymbol) {
+  if (!page || typeof page !== 'object' || Array.isArray(page)) throw new Error('Invalid Massive response envelope.');
+  if (page.status != null && !['OK', 'DELAYED'].includes(String(page.status).toUpperCase())) throw new Error(`Unexpected Massive status: ${page.status}`);
+  if (page.ticker != null && expectedSymbol && String(page.ticker).toUpperCase() !== String(expectedSymbol).toUpperCase()) throw new Error(`Ticker mismatch: expected ${expectedSymbol}, got ${page.ticker}`);
+  if (page.adjusted != null && page.adjusted !== true) throw new Error('Massive response is not adjusted.');
+  if (!Array.isArray(page.results)) throw new Error('Massive response is missing a results array.');
 }
 
 export async function collectChunk(firstUrl, options) {
@@ -91,7 +105,7 @@ export async function collectChunk(firstUrl, options) {
     if (++pages > (options.maxPages ?? DEFAULT_MAX_PAGES)) throw new Error('Maximum page count exceeded.');
     seen.add(parsed.href);
     const page = await requestWithRetry(parsed.href, options);
-    if (!Array.isArray(page.results)) throw new Error('Massive response is missing a results array.');
+    validateEnvelope(page, options.symbol);
     results.push(...page.results);
     url = page.next_url || null;
   }
@@ -109,24 +123,43 @@ function validateRows(rows, context, previousTimestamp = null) {
   rows.forEach((row, index) => {
     if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error(`${context}: row ${index + 1} is not an object`);
     for (const field of ['t', 'o', 'h', 'l', 'c', 'v']) if (!Number.isFinite(row[field])) throw new Error(`${context}: row ${index + 1} has invalid ${field}`);
-    if (!Number.isSafeInteger(row.t)) throw new Error(`${context}: row ${index + 1} has invalid t`);
-    for (const field of ['vw', 'n']) if (row[field] != null && !Number.isFinite(row[field])) throw new Error(`${context}: row ${index + 1} has invalid ${field}`);
+    if (!Number.isSafeInteger(row.t) || row.t < 0 || row.t % 60_000 !== 0) throw new Error(`${context}: row ${index + 1} has invalid or non-minute-aligned t`);
+    if (row.v < 0) throw new Error(`${context}: row ${index + 1} has negative volume`);
+    if (row.h < row.l || row.h < row.o || row.h < row.c || row.l > row.o || row.l > row.c) throw new Error(`${context}: row ${index + 1} has inconsistent OHLC`);
+    if (row.vw != null && !Number.isFinite(row.vw)) throw new Error(`${context}: row ${index + 1} has invalid vw`);
+    if (row.n != null && (!Number.isSafeInteger(row.n) || row.n < 0)) throw new Error(`${context}: row ${index + 1} has invalid n`);
+    if (row.otc != null && typeof row.otc !== 'boolean') throw new Error(`${context}: row ${index + 1} has invalid otc`);
     if (previous !== null && row.t <= previous) throw new Error(`${context}: duplicate or out-of-order timestamp ${row.t}`);
     previous = row.t;
   });
   return previous;
 }
 
-export async function validateArchive(directory) {
+function validateManifest(manifest, expected = null) {
+  if (manifest.schemaVersion !== 1 || manifest.provider !== 'Massive' || manifest.multiplier !== 1 || manifest.timespan !== 'minute' || manifest.adjusted !== true || manifest.limit !== 50000 || !Array.isArray(manifest.chunks)) throw new Error('Invalid downloader manifest.');
+  if (expected && (manifest.symbol !== expected.symbol || manifest.from !== expected.from || manifest.to !== expected.to)) throw new Error('Manifest does not match requested symbol/date range.');
+  const planned = calendarChunks(manifest.from, manifest.to);
+  if (planned.length !== manifest.chunks.length) throw new Error('Manifest chunk boundaries do not match requested range.');
+  planned.forEach((chunk, i) => {
+    if (manifest.chunks[i].from !== chunk.from || manifest.chunks[i].to !== chunk.to) throw new Error('Manifest chunk boundaries do not match requested range.');
+  });
+}
+
+function validateStoredDocument(document, symbol, context) {
+  validateEnvelope(document, symbol);
+  validateRows(document.results, context);
+}
+
+export async function validateArchive(directory, expected = null) {
   const manifestPath = join(resolve(directory), 'manifest.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-  if (manifest.schemaVersion !== 1 || !Array.isArray(manifest.chunks)) throw new Error('Invalid downloader manifest.');
+  validateManifest(manifest, expected);
   let previous = null;
   for (const chunk of manifest.chunks) {
     const path = join(resolve(directory), chunk.file), bytes = await readFile(path);
     if (sha256(bytes) !== chunk.sha256) throw new Error(`Checksum mismatch: ${chunk.file}`);
     const document = JSON.parse(bytes.toString('utf8'));
-    if (!Array.isArray(document.results)) throw new Error(`${chunk.file}: missing results array`);
+    validateStoredDocument(document, manifest.symbol, chunk.file);
     previous = validateRows(document.results, chunk.file, previous);
     if (document.results.length !== chunk.rowCount) throw new Error(`${chunk.file}: row count differs from manifest`);
   }
@@ -144,11 +177,26 @@ export async function downloadArchive({ symbol, from, to, directory, resume = fa
   const requester = request || (url => curlRequest(url, apiKey));
   for (const chunk of calendarChunks(from, to)) {
     const file = `${symbol}-${chunk.from}-${chunk.to}-1m.json`, path = join(root, file);
-    const prior = old?.symbol === symbol && old?.from === from && old?.to === to && old.chunks?.find(item => item.file === file);
-    if (resume && prior) {
-      try { const bytes = await readFile(path); if (sha256(bytes) === prior.sha256) { manifest.chunks.push(prior); continue; } } catch {}
+    let prior = null;
+    if (resume && old) {
+      try {
+        validateManifest(old, { symbol, from, to });
+        prior = old.chunks.find(item => item.file === file && item.from === chunk.from && item.to === chunk.to);
+      } catch {}
     }
-    const collected = await collectChunk(initialUrl(symbol, chunk), { request: requester, wait, intervalMs, maxRetries, maxPages });
+    if (resume && prior) {
+      try {
+        const bytes = await readFile(path);
+        if (sha256(bytes) === prior.sha256) {
+          const document = JSON.parse(bytes.toString('utf8'));
+          validateStoredDocument(document, symbol, file);
+          if (document.results.length !== prior.rowCount) throw new Error('row count differs from manifest');
+          manifest.chunks.push(prior);
+          continue;
+        }
+      } catch {}
+    }
+    const collected = await collectChunk(initialUrl(symbol, chunk), { request: requester, wait, intervalMs, maxRetries, maxPages, symbol });
     validateRows(collected.results, file);
     const document = { ticker: symbol, adjusted: true, queryCount: collected.results.length, resultsCount: collected.results.length, results: collected.results };
     const bytes = Buffer.from(`${JSON.stringify(document)}\n`);
@@ -157,7 +205,7 @@ export async function downloadArchive({ symbol, from, to, directory, resume = fa
     await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   }
   await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  await validateArchive(root);
+  await validateArchive(root, { symbol, from, to });
   return manifest;
 }
 
