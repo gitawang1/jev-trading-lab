@@ -184,6 +184,29 @@ This implementation deliberately does **not** invent an exchange calendar. Time-
 
 ## Offline Massive one-minute ingestion and aggregation
 
+### Secure, resumable historical download
+
+`massive-download.js` is the deliberately separate network acquisition stage. It divides the requested inclusive UTC date range into deterministic seven-calendar-day chunks and requests adjusted one-minute aggregates with `limit=50000`. The default 13-second interval applies before every page and retry. Rate-limit (429), server (5xx), and network failures have bounded retries; authentication failures (401/403) are permanent immediately. Pagination is accepted only from `https://api.massive.com`, with loop and maximum-page guards.
+
+The API key is read only for an authenticated download. It is passed to curl in an in-memory stdin configuration, never in argv, is removed from curl's environment, and is never written to output. Offline tests and archive validation neither read the key nor contact Massive.
+
+```bash
+export MASSIVE_API_KEY='your Massive API key'
+npm run massive:download -- --symbol NVDA --from 2024-01-01 --to 2024-12-31 \
+  --directory ./massive-archive --resume
+```
+
+Each chunk is first written as a private `.part` and atomically renamed only when complete. `manifest.json` records the schema, query settings, exact chunk boundaries, page and row counts, and SHA-256 checksum. `--resume` skips a file only when its checksum matches its manifest entry; missing or corrupt chunks are fetched again. Existing completed data is not silently trusted by filename.
+
+Run the deterministic downloader suite and network-free archive validator with:
+
+```bash
+npm run test:massive-download
+npm run massive:validate -- --directory ./massive-archive
+```
+
+Validation reads all manifest chunks in order, verifies checksums and row counts, and rejects malformed, duplicate, or non-increasing timestamps both within and across chunk boundaries. Downloaded records preserve provider `t,o,h,l,c,v` and optional `vw,n,otc` values exactly, including fractional volume. Pages and chunks are concatenated without interpolation, rounding, or silent deduplication.
+
 This is a separate, network-free stage in front of the predictive validator:
 
 ```text
