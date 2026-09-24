@@ -1,0 +1,367 @@
+diff --git a/.gitignore b/.gitignore
+index 52d122b..555e43b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,4 +2,5 @@
+ .env.*
+ !.env.example
+ node_modules/
+-
++massive-archive/
++*.part
+diff --git a/README.md b/README.md
+index 95c491b..eaf1010 100644
+--- a/README.md
++++ b/README.md
+@@ -184,6 +184,29 @@ This implementation deliberately does **not** invent an exchange calendar. Time-
+ 
+ ## Offline Massive one-minute ingestion and aggregation
+ 
++### Secure, resumable historical download
++
++`massive-download.js` is the deliberately separate network acquisition stage. It divides the requested inclusive UTC date range into deterministic seven-calendar-day chunks and requests adjusted one-minute aggregates with `limit=50000`. The default 13-second interval applies before every page and retry. Rate-limit (429), server (5xx), and network failures have bounded retries; authentication failures (401/403) are permanent immediately. Pagination is accepted only from `https://api.massive.com`, with loop and maximum-page guards.
++
++The API key is read only for an authenticated download. It is passed to curl in an in-memory stdin configuration, never in argv, is removed from curl's environment, and is never written to output. Offline tests and archive validation neither read the key nor contact Massive.
++
++```bash
++export MASSIVE_API_KEY='your Massive API key'
++npm run massive:download -- --symbol NVDA --from 2024-01-01 --to 2024-12-31 \
++  --directory ./massive-archive --resume
++```
++
++Each chunk is first written as a private `.part` and atomically renamed only when complete. `manifest.json` records the schema, query settings, exact chunk boundaries, page and row counts, and SHA-256 checksum. `--resume` skips a file only when its checksum matches its manifest entry; missing or corrupt chunks are fetched again. Existing completed data is not silently trusted by filename.
++
++Run the deterministic downloader suite and network-free archive validator with:
++
++```bash
++npm run test:massive-download
++npm run massive:validate -- --directory ./massive-archive
++```
++
++Validation reads all manifest chunks in order, verifies checksums and row counts, and rejects malformed, duplicate, or non-increasing timestamps both within and across chunk boundaries. Downloaded records preserve provider `t,o,h,l,c,v` and optional `vw,n,otc` values exactly, including fractional volume. Pages and chunks are concatenated without interpolation, rounding, or silent deduplication.
++
+ This is a separate, network-free stage in front of the predictive validator:
+ 
+ ```text
+diff --git a/massive-download.js b/massive-download.js
+new file mode 100644
+index 0000000..60b5fdb
+--- /dev/null
++++ b/massive-download.js
+@@ -0,0 +1,178 @@
++#!/usr/bin/env node
++import { createHash } from 'node:crypto';
++import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
++import { join, resolve } from 'node:path';
++import { spawn } from 'node:child_process';
++import { pathToFileURL } from 'node:url';
++
++export const API_ORIGIN = 'https://api.massive.com';
++export const DEFAULT_INTERVAL_MS = 13_000;
++export const DEFAULT_MAX_PAGES = 1_000;
++export const DEFAULT_MAX_RETRIES = 4;
++const DAY_MS = 86_400_000;
++const SAFE_FIELDS = ['t', 'o', 'h', 'l', 'c', 'v', 'vw', 'n', 'otc'];
++
++export const sleep = ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms));
++export const sha256 = data => createHash('sha256').update(data).digest('hex');
++
++function isoDay(value) {
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) throw new Error(`Invalid calendar date: ${value}`);
++  return value;
++}
++
++export function calendarChunks(from, to) {
++  const first = Date.parse(`${isoDay(from)}T00:00:00Z`), last = Date.parse(`${isoDay(to)}T00:00:00Z`);
++  if (first > last) throw new Error('--from must not be after --to');
++  const chunks = [];
++  for (let start = first; start <= last; start += 7 * DAY_MS) {
++    const end = Math.min(start + 6 * DAY_MS, last);
++    chunks.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10) });
++  }
++  return chunks;
++}
++
++export function initialUrl(symbol, chunk) {
++  const ticker = encodeURIComponent(symbol);
++  return `${API_ORIGIN}/v2/aggs/ticker/${ticker}/range/1/minute/${chunk.from}/${chunk.to}?adjusted=true&sort=asc&limit=50000`;
++}
++
++function curlConfig(apiKey) {
++  if (!apiKey || /[\r\n"\\]/.test(apiKey)) throw new Error('MASSIVE_API_KEY is missing or contains unsafe characters.');
++  return `header = "Authorization: Bearer ${apiKey}"\n`;
++}
++
++export function curlRequest(url, apiKey, { spawnImpl = spawn } = {}) {
++  const config = curlConfig(apiKey);
++  return new Promise((resolvePromise, reject) => {
++    const childEnv = { ...process.env }; delete childEnv.MASSIVE_API_KEY;
++    const child = spawnImpl('curl', ['--silent', '--show-error', '--location', '--max-redirs', '0', '--config', '-', '--write-out', '\\n%{http_code}', url], { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
++    const stdout = [], stderr = [];
++    child.stdout.on('data', value => stdout.push(value));
++    child.stderr.on('data', value => stderr.push(value));
++    child.on('error', reject);
++    child.on('close', code => {
++      if (code !== 0) return reject(new Error(`curl transport failure (exit ${code}): ${Buffer.concat(stderr).toString('utf8').trim()}`));
++      const output = Buffer.concat(stdout).toString('utf8'), split = output.lastIndexOf('\n');
++      if (split < 0) return reject(new Error('curl did not return an HTTP status'));
++      resolvePromise({ status: Number(output.slice(split + 1)), body: output.slice(0, split) });
++    });
++    child.stdin.end(config);
++  });
++}
++
++export async function requestWithRetry(url, { request, wait = sleep, intervalMs = DEFAULT_INTERVAL_MS, maxRetries = DEFAULT_MAX_RETRIES, onRequest = () => {} }) {
++  let attempt = 0;
++  while (true) {
++    if (intervalMs) await wait(intervalMs);
++    onRequest(url, attempt);
++    try {
++      const response = await request(url);
++      if (response.status === 401 || response.status === 403) throw Object.assign(new Error(`Permanent authentication failure (HTTP ${response.status}).`), { permanent: true });
++      if (response.status === 429 || response.status >= 500) {
++        if (attempt++ < maxRetries) continue;
++        throw new Error(`Retry limit exhausted after HTTP ${response.status}.`);
++      }
++      if (response.status < 200 || response.status >= 300) throw Object.assign(new Error(`Permanent HTTP ${response.status}.`), { permanent: true });
++      return JSON.parse(response.body);
++    } catch (error) {
++      if (error.permanent || error instanceof SyntaxError) throw error;
++      if (attempt++ >= maxRetries) throw new Error(`Retry limit exhausted after network failure: ${error.message}`);
++    }
++  }
++}
++
++export async function collectChunk(firstUrl, options) {
++  const seen = new Set(), results = [];
++  let url = firstUrl, pages = 0;
++  while (url) {
++    const parsed = new URL(url);
++    if (parsed.origin !== API_ORIGIN) throw new Error(`Refusing cross-origin pagination URL: ${parsed.origin}`);
++    if (seen.has(parsed.href)) throw new Error('Pagination loop detected.');
++    if (++pages > (options.maxPages ?? DEFAULT_MAX_PAGES)) throw new Error('Maximum page count exceeded.');
++    seen.add(parsed.href);
++    const page = await requestWithRetry(parsed.href, options);
++    if (!Array.isArray(page.results)) throw new Error('Massive response is missing a results array.');
++    results.push(...page.results);
++    url = page.next_url || null;
++  }
++  return { results, pages };
++}
++
++async function atomicWrite(path, data) {
++  const part = `${path}.part`;
++  await writeFile(part, data, { mode: 0o600 });
++  await rename(part, path);
++}
++
++function validateRows(rows, context, previousTimestamp = null) {
++  let previous = previousTimestamp;
++  rows.forEach((row, index) => {
++    if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error(`${context}: row ${index + 1} is not an object`);
++    for (const field of ['t', 'o', 'h', 'l', 'c', 'v']) if (!Number.isFinite(row[field])) throw new Error(`${context}: row ${index + 1} has invalid ${field}`);
++    if (!Number.isSafeInteger(row.t)) throw new Error(`${context}: row ${index + 1} has invalid t`);
++    for (const field of ['vw', 'n']) if (row[field] != null && !Number.isFinite(row[field])) throw new Error(`${context}: row ${index + 1} has invalid ${field}`);
++    if (previous !== null && row.t <= previous) throw new Error(`${context}: duplicate or out-of-order timestamp ${row.t}`);
++    previous = row.t;
++  });
++  return previous;
++}
++
++export async function validateArchive(directory) {
++  const manifestPath = join(resolve(directory), 'manifest.json');
++  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
++  if (manifest.schemaVersion !== 1 || !Array.isArray(manifest.chunks)) throw new Error('Invalid downloader manifest.');
++  let previous = null;
++  for (const chunk of manifest.chunks) {
++    const path = join(resolve(directory), chunk.file), bytes = await readFile(path);
++    if (sha256(bytes) !== chunk.sha256) throw new Error(`Checksum mismatch: ${chunk.file}`);
++    const document = JSON.parse(bytes.toString('utf8'));
++    if (!Array.isArray(document.results)) throw new Error(`${chunk.file}: missing results array`);
++    previous = validateRows(document.results, chunk.file, previous);
++    if (document.results.length !== chunk.rowCount) throw new Error(`${chunk.file}: row count differs from manifest`);
++  }
++  return { chunks: manifest.chunks.length, rows: manifest.chunks.reduce((sum, item) => sum + item.rowCount, 0) };
++}
++
++export async function downloadArchive({ symbol, from, to, directory, resume = false, apiKey, request, wait = sleep, intervalMs = DEFAULT_INTERVAL_MS, maxRetries = DEFAULT_MAX_RETRIES, maxPages = DEFAULT_MAX_PAGES }) {
++  if (!symbol || !directory) throw new Error('symbol and directory are required');
++  if (!apiKey && !request) throw new Error('MASSIVE_API_KEY is required.');
++  const root = resolve(directory); await mkdir(root, { recursive: true, mode: 0o700 });
++  const manifestPath = join(root, 'manifest.json');
++  let old = null;
++  if (resume) try { old = JSON.parse(await readFile(manifestPath, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
++  const manifest = { schemaVersion: 1, provider: 'Massive', symbol, multiplier: 1, timespan: 'minute', adjusted: true, limit: 50000, from, to, chunks: [] };
++  const requester = request || (url => curlRequest(url, apiKey));
++  for (const chunk of calendarChunks(from, to)) {
++    const file = `${symbol}-${chunk.from}-${chunk.to}-1m.json`, path = join(root, file);
++    const prior = old?.symbol === symbol && old?.from === from && old?.to === to && old.chunks?.find(item => item.file === file);
++    if (resume && prior) {
++      try { const bytes = await readFile(path); if (sha256(bytes) === prior.sha256) { manifest.chunks.push(prior); continue; } } catch {}
++    }
++    const collected = await collectChunk(initialUrl(symbol, chunk), { request: requester, wait, intervalMs, maxRetries, maxPages });
++    validateRows(collected.results, file);
++    const document = { ticker: symbol, adjusted: true, queryCount: collected.results.length, resultsCount: collected.results.length, results: collected.results };
++    const bytes = Buffer.from(`${JSON.stringify(document)}\n`);
++    await atomicWrite(path, bytes);
++    manifest.chunks.push({ ...chunk, file, rowCount: collected.results.length, pages: collected.pages, sha256: sha256(bytes) });
++    await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
++  }
++  await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
++  await validateArchive(root);
++  return manifest;
++}
++
++function args(argv) {
++  const command = argv.shift(), result = { command, resume: false };
++  while (argv.length) { const key = argv.shift(); if (key === '--resume') result.resume = true; else { if (!key.startsWith('--') || !argv.length) throw new Error('Invalid arguments.'); result[key.slice(2)] = argv.shift(); } }
++  return result;
++}
++
++export async function main(argv = process.argv.slice(2)) {
++  const options = args([...argv]);
++  if (options.command === 'validate' && options.directory) return console.log(JSON.stringify(await validateArchive(options.directory)));
++  if (options.command !== 'download' || !options.symbol || !options.from || !options.to || !options.directory) throw new Error('Usage: massive-download.js download --symbol NVDA --from YYYY-MM-DD --to YYYY-MM-DD --directory DIR [--resume]\n       massive-download.js validate --directory DIR');
++  const manifest = await downloadArchive({ ...options, apiKey: process.env.MASSIVE_API_KEY });
++  console.log(`Completed ${manifest.chunks.length} chunk(s) in ${resolve(options.directory)}.`);
++}
++
++if (import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+diff --git a/massive-download.test.js b/massive-download.test.js
+new file mode 100644
+index 0000000..b51405b
+--- /dev/null
++++ b/massive-download.test.js
+@@ -0,0 +1,118 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { EventEmitter } from 'node:events';
++import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { PassThrough } from 'node:stream';
++import { API_ORIGIN, calendarChunks, collectChunk, curlRequest, downloadArchive, initialUrl, requestWithRetry, sha256, validateArchive } from './massive-download.js';
++
++const row = (t, extra = {}) => ({ t, o: 1, h: 2, l: 0.5, c: 1.5, v: 0.125, ...extra });
++const response = (results, next_url) => ({ status: 200, body: JSON.stringify({ results, next_url }) });
++
++test('calendar chunks are deterministic seven-calendar-day inclusive ranges', () => {
++  assert.deepEqual(calendarChunks('2024-01-01', '2024-01-16'), [
++    { from: '2024-01-01', to: '2024-01-07' }, { from: '2024-01-08', to: '2024-01-14' }, { from: '2024-01-15', to: '2024-01-16' },
++  ]);
++});
++
++test('URL requests adjusted one-minute aggregates with limit 50000', () => {
++  assert.equal(initialUrl('NVDA', { from: '2024-01-01', to: '2024-01-07' }), `${API_ORIGIN}/v2/aggs/ticker/NVDA/range/1/minute/2024-01-01/2024-01-07?adjusted=true&sort=asc&limit=50000`);
++});
++
++test('curl bearer secret goes through stdin config, never argv or child environment', async () => {
++  let captured;
++  const spawnImpl = (command, argv, options) => {
++    const child = new EventEmitter(); child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
++    let config = ''; child.stdin.on('data', data => { config += data; });
++    captured = { command, argv, options, get config() { return config; } };
++    queueMicrotask(() => { child.stdout.end('{}\n200'); child.stderr.end(); child.emit('close', 0); });
++    return child;
++  };
++  process.env.MASSIVE_API_KEY = 'parent-secret';
++  await curlRequest(`${API_ORIGIN}/x`, 'stdin-secret', { spawnImpl });
++  delete process.env.MASSIVE_API_KEY;
++  assert.ok(!captured.argv.join(' ').includes('stdin-secret'));
++  assert.equal(captured.options.env.MASSIVE_API_KEY, undefined);
++  assert.match(captured.config, /Authorization: Bearer stdin-secret/);
++});
++
++test('unsafe credential characters are rejected before curl', async () => {
++  assert.throws(() => curlRequest(`${API_ORIGIN}/x`, 'bad\nkey', { spawnImpl: () => assert.fail('must not spawn') }), /unsafe/);
++});
++
++test('same-origin pagination retains every row and optional field exactly', async () => {
++  const urls = [], first = `${API_ORIGIN}/first`, next = `${API_ORIGIN}/next`;
++  const result = await collectChunk(first, { intervalMs: 0, request: async url => { urls.push(url); return url === first ? response([row(1, { vw: 1.2, n: 3, otc: true })], next) : response([row(2)], null); } });
++  assert.deepEqual(urls, [first, next]); assert.equal(result.results[0].v, 0.125); assert.deepEqual(result.results[0], row(1, { vw: 1.2, n: 3, otc: true }));
++});
++
++test('cross-origin next_url is rejected without making that request', async () => {
++  let calls = 0;
++  await assert.rejects(collectChunk(`${API_ORIGIN}/first`, { intervalMs: 0, request: async () => { calls++; return response([], 'https://evil.example/steal'); } }), /cross-origin/);
++  assert.equal(calls, 1);
++});
++
++test('pagination loops are detected', async () => {
++  const url = `${API_ORIGIN}/same`;
++  await assert.rejects(collectChunk(url, { intervalMs: 0, request: async () => response([], url) }), /loop/);
++});
++
++test('maximum page count bounds pagination', async () => {
++  await assert.rejects(collectChunk(`${API_ORIGIN}/1`, { intervalMs: 0, maxPages: 1, request: async () => response([], `${API_ORIGIN}/2`) }), /Maximum page/);
++});
++
++test('429, 5xx, and network errors retry only to the configured bound', async () => {
++  for (const failure of [{ status: 429, body: '' }, { status: 503, body: '' }, new Error('offline')]) {
++    let calls = 0;
++    await assert.rejects(requestWithRetry('x', { intervalMs: 0, maxRetries: 2, request: async () => { calls++; if (failure instanceof Error) throw failure; return failure; } }), /Retry limit/);
++    assert.equal(calls, 3);
++  }
++});
++
++test('401 and 403 fail immediately and permanently', async () => {
++  for (const status of [401, 403]) { let calls = 0; await assert.rejects(requestWithRetry('x', { intervalMs: 0, maxRetries: 9, request: async () => { calls++; return { status, body: '' }; } }), /Permanent authentication/); assert.equal(calls, 1); }
++});
++
++test('default interval is thirteen seconds before a request', async () => {
++  const waits = [];
++  await requestWithRetry('x', { wait: async ms => waits.push(ms), request: async () => response([]) });
++  assert.deepEqual(waits, [13_000]);
++});
++
++test('download writes completed chunks, checksums, and machine-readable manifest', async () => {
++  const directory = await mkdtemp(join(tmpdir(), 'massive-test-'));
++  const manifest = await downloadArchive({ symbol: 'NVDA', from: '2024-01-01', to: '2024-01-08', directory, apiKey: 'unused', intervalMs: 0, request: async url => response([row(url.includes('01-08') ? 2 : 1)]) });
++  assert.equal(manifest.chunks.length, 2);
++  for (const chunk of manifest.chunks) { const bytes = await readFile(join(directory, chunk.file)); assert.equal(chunk.sha256, sha256(bytes)); await assert.rejects(readFile(join(directory, `${chunk.file}.part`))); }
++  assert.deepEqual(await validateArchive(directory), { chunks: 2, rows: 2 });
++});
++
++test('checksum-aware resume skips intact chunks and re-downloads corrupt chunks', async () => {
++  const directory = await mkdtemp(join(tmpdir(), 'massive-resume-')); let calls = 0;
++  const options = { symbol: 'NVDA', from: '2024-01-01', to: '2024-01-14', directory, apiKey: 'unused', intervalMs: 0, request: async url => { calls++; return response([row(url.includes('01-08') ? 2 : 1)]); } };
++  const first = await downloadArchive(options); assert.equal(calls, 2);
++  await downloadArchive({ ...options, resume: true }); assert.equal(calls, 2);
++  await writeFile(join(directory, first.chunks[1].file), '{corrupt}\n');
++  await downloadArchive({ ...options, resume: true }); assert.equal(calls, 3);
++});
++
++test('offline archive validation detects checksum changes', async () => {
++  const directory = await mkdtemp(join(tmpdir(), 'massive-checksum-'));
++  const manifest = await downloadArchive({ symbol: 'NVDA', from: '2024-01-01', to: '2024-01-01', directory, intervalMs: 0, request: async () => response([row(1)]) });
++  await writeFile(join(directory, manifest.chunks[0].file), '{}\n');
++  await assert.rejects(validateArchive(directory), /Checksum mismatch/);
++});
++
++test('offline validation rejects duplicate and out-of-order rows across chunks without deduplication', async () => {
++  const directory = await mkdtemp(join(tmpdir(), 'massive-order-'));
++  await assert.rejects(downloadArchive({ symbol: 'NVDA', from: '2024-01-01', to: '2024-01-08', directory, intervalMs: 0, request: async () => response([row(1)]) }), /duplicate or out-of-order/);
++});
++
++test('fractional volume and provider fields survive the persisted archive', async () => {
++  const directory = await mkdtemp(join(tmpdir(), 'massive-fields-'));
++  const wanted = row(1, { v: 0.000001, vw: 1.25, n: 7, otc: false });
++  const manifest = await downloadArchive({ symbol: 'NVDA', from: '2024-01-01', to: '2024-01-01', directory, intervalMs: 0, request: async () => response([wanted]) });
++  const stored = JSON.parse(await readFile(join(directory, manifest.chunks[0].file), 'utf8'));
++  assert.deepEqual(stored.results[0], wanted);
++});
+diff --git a/package.json b/package.json
+index 2cb29f7..eacc273 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,9 @@
+     "sensitivity:jev": "node jev-sensitivity.js",
+     "test:historical": "node --test historical-validation.test.js",
+     "test:offline-ingestion": "node --test massive-offline.test.js",
++    "test:massive-download": "node --test massive-download.test.js",
++    "massive:download": "node massive-download.js download",
++    "massive:validate": "node massive-download.js validate",
+     "offline:convert": "node massive-offline.js convert",
+     "historical:generate": "node historical-validation.js generate",
+     "historical:diagnostic": "node historical-validation.js diagnostic"
