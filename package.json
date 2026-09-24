@@ -12,6 +12,8 @@
     "validate:sensitivity": "node jev-sensitivity.js --validate",
     "sensitivity:jev": "node jev-sensitivity.js",
     "test:historical": "node --test historical-validation.test.js",
+    "test:offline-ingestion": "node --test massive-offline.test.js",
+    "offline:convert": "node massive-offline.js convert",
     "historical:generate": "node historical-validation.js generate",
     "historical:diagnostic": "node historical-validation.js diagnostic"
   },

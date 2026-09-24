@@ -181,3 +181,56 @@ npm run historical:diagnostic -- --input ./NVDA-5m.csv \
 ### Calendar and data limitations
 
 This implementation deliberately does **not** invent an exchange calendar. Time-of-day sessions are recognized, but exchange holidays, early closes, unscheduled closures, and missing vendor bars are not inferred or repaired. Exact-spacing/full-bucket rules prevent gaps from being treated as complete higher-timeframe bars or future horizons; users must interpret exclusions in light of their vendor data and the actual historical exchange calendar. Exclusion categories in the report can overlap during feature warm-up; the insufficient-future category is evaluated only after all feature requirements pass.
+
+## Offline Massive one-minute ingestion and aggregation
+
+This is a separate, network-free stage in front of the predictive validator:
+
+```text
+raw Massive 1m JSON (unchanged)
+  -> offline ingestion and integrity validation
+  -> clean 5m OHLCV CSV
+  -> historical-validation.js
+  -> time-t features and separately stored future outcomes
+```
+
+`massive-offline.js` only reads the source file; it never modifies or overwrites it and makes no market-data or Jev requests. Input may be either a Massive response object with a `results` array (and optional `ticker`/`symbol`) or a top-level array. Each input record uses the provider fields `t`, `o`, `h`, `l`, `c`, `v`, and optional `vw` and `n`. The `--symbol` option overrides the envelope symbol and otherwise defaults to `NVDA`.
+
+Provider `t` is Unix milliseconds for the **one-minute bar open**. Normalized `barClose` is exactly one minute later. Session membership and five-minute alignment use the IANA `America/New_York` exchange timezone by default, so daylight-saving transitions use the applicable historical offset rather than a fixed UTC offset. `--session rth` retains bar opens from 09:30 inclusive through 16:00 exclusive; `--session extended` retains 04:00 inclusive through 20:00 exclusive.
+
+Every output bucket is aligned from that session's local start and requires the exact five expected minute opens at offsets 0, 1, 2, 3, and 4. Missing, duplicated, malformed, or misaligned constituents cause the affected bucket to be itemized and omitted. Nothing is deduplicated, invented, forward-filled, or interpolated. OHLC follows first/max/min/final aggregation and volume is summed as supplied, including fractional volume without integer rounding.
+
+Provider-derived VWAP is retained internally only when all five constituent VWAPs are finite and is weighted by constituent volume (with positive aggregate volume); it is not written into the validator CSV and never replaces the validator's independently calculated session VWAP. Transaction count is retained internally only when every constituent supplies a non-negative integer count, in which case the five counts are summed. The clean CSV intentionally contains only `timestamp,open,high,low,close,volume`.
+
+Run the deterministic, offline aggregation tests:
+
+```bash
+npm run test:offline-ingestion
+```
+
+Convert an already-downloaded NVDA file and write a separate audit report:
+
+```bash
+npm run offline:convert -- \
+  --input ./NVDA-1m-raw.json \
+  --output ./NVDA-5m-clean.csv \
+  --report ./NVDA-5m-integrity.txt \
+  --symbol NVDA \
+  --session rth \
+  --exchange-timezone America/New_York
+```
+
+The output `timestamp` remains the **five-minute bar open**, encoded as an offset-bearing UTC ISO timestamp. Therefore, pass it to the existing validator with the required open-stamp option (no `--input-timezone` is needed because these timestamps end in `Z`):
+
+```bash
+npm run historical:generate -- \
+  --input ./NVDA-5m-clean.csv \
+  --timestamp-semantics open \
+  --exchange-timezone America/New_York \
+  --session regular \
+  --symbol NVDA
+```
+
+The integrity report counts and itemizes malformed rows, duplicate and out-of-order timestamps, outside-session records, incomplete buckets, and missing expected minute opens, while also recording input/output ranges and session configuration. Source-order problems are reported, then valid rows are sorted deterministically for aggregation; ambiguous duplicates still poison their bucket.
+
+**Calendar limitation:** session-time filtering alone does not establish that a date is a valid full or partial U.S. exchange trading day. This layer deliberately contains no invented holiday or early-close calendar. Holidays, early closes, and exceptional closures require separate authoritative calendar validation or provider-aware review; an early-close file may consequently show omitted/absent session buckets depending on which buckets have source records.
