@@ -1,0 +1,109 @@
+name: Prepare AMD canonical validation data
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "First AMD calendar date (YYYY-MM-DD)"
+        required: true
+        default: "2024-01-01"
+      to:
+        description: "Last AMD calendar date (YYYY-MM-DD)"
+        required: true
+        default: "2026-09-30"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-amd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out validation repository
+        uses: actions/checkout@v4
+
+      - name: Check out pinned Jev engine
+        uses: actions/checkout@v4
+        with:
+          repository: gitawang1/jev-trading-lab
+          ref: 754792a2fbace84fe25c0145606585abdcb136a8
+          path: jev-code
+
+      - name: Verify frozen engine commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C jev-code rev-parse HEAD)" = "754792a2fbace84fe25c0145606585abdcb136a8"
+
+      - name: Download canonical AMD one-minute history
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd jev-code
+          node massive-download.js download \
+            --symbol AMD \
+            --from "${{ inputs.from }}" \
+            --to "${{ inputs.to }}" \
+            --directory ../amd-raw \
+            --resume
+          node massive-download.js validate --directory ../amd-raw
+
+      - name: Assemble immutable one-minute archive
+        shell: python
+        run: |
+          import json, hashlib
+          from pathlib import Path
+
+          root = Path("amd-raw")
+          manifest = json.loads((root/"manifest.json").read_text())
+          rows = []
+          for c in manifest["chunks"]:
+              doc = json.loads((root/c["file"]).read_text())
+              rows.extend(doc["results"])
+          rows.sort(key=lambda x: x["t"])
+          if len({r["t"] for r in rows}) != len(rows):
+              raise SystemExit("ERROR: duplicate AMD minute timestamps")
+          out = {"ticker":"AMD","adjusted":True,"results":rows}
+          p = Path("amd-1m-canonical.json")
+          p.write_text(json.dumps(out,separators=(",",":"))+"\n")
+          print("AMD 1m rows:", len(rows))
+          print("AMD 1m SHA256:", hashlib.sha256(p.read_bytes()).hexdigest())
+
+      - name: Derive canonical RTH five-minute bars
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd jev-code
+          node massive-offline.js convert \
+            --input ../amd-1m-canonical.json \
+            --output ../amd-5m-rth.csv \
+            --report ../amd-ingestion-integrity.txt \
+            --symbol AMD \
+            --session rth \
+            --exchange-timezone America/New_York
+
+      - name: Fingerprint validation inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum amd-1m-canonical.json amd-5m-rth.csv amd-raw/manifest.json | tee amd-input-sha256.txt
+          wc -l amd-5m-rth.csv
+          echo "Pinned engine: 754792a2fbace84fe25c0145606585abdcb136a8" | tee amd-engine-freeze.txt
+          echo "IMPORTANT: no AMD outcome inspection or AMD-derived retuning occurs in this workflow." | tee -a amd-engine-freeze.txt
+
+      - name: Upload frozen AMD canonical inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-canonical-validation-inputs
+          path: |
+            amd-5m-rth.csv
+            amd-ingestion-integrity.txt
+            amd-input-sha256.txt
+            amd-engine-freeze.txt
+            amd-raw/manifest.json
+          if-no-files-found: error
+          retention-days: 90
