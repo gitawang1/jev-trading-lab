@@ -1,0 +1,34 @@
+name: Test frozen JEV V3 HMA and POC module
+
+on:
+  push:
+    branches:
+      - feature/jev-v3-hma-poc-validation
+    paths:
+      - 'jev-v3/**'
+      - '.github/workflows/test-jev-v3-features.yml'
+  pull_request:
+    paths:
+      - 'jev-v3/**'
+      - '.github/workflows/test-jev-v3-features.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run frozen V3 feature tests
+        working-directory: jev-v3
+        run: python -m unittest -v test_features.py
+      - name: Compile feature module
+        run: python -m py_compile jev-v3/jev_v3_features.py

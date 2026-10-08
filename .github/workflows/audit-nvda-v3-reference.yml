@@ -1,0 +1,59 @@
+name: Audit frozen NVDA V3 reference
+
+on:
+  workflow_dispatch:
+    inputs:
+      reference_run_id:
+        description: 'Run ID of checksum-verified reference publisher in private data repository'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  nvda-reference-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout isolated V3 module
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Require cross-repository read token
+        env:
+          READ_TOKEN: ${{ secrets.JEV_PRIVATE_DATA_READ_TOKEN }}
+        run: |
+          test -n "$READ_TOKEN" || { echo "Missing JEV_PRIVATE_DATA_READ_TOKEN"; exit 1; }
+      - name: Download frozen canonical NVDA five-minute dataset
+        uses: actions/download-artifact@v4
+        with:
+          repository: gitawang1/jev-trading-data-private
+          run-id: '36093575061'
+          name: nvda-canonical-5min-dataset
+          path: canonical
+          github-token: ${{ secrets.JEV_PRIVATE_DATA_READ_TOKEN }}
+      - name: Download SHA-verified frozen V3 reference
+        uses: actions/download-artifact@v4
+        with:
+          repository: gitawang1/jev-trading-data-private
+          run-id: ${{ inputs.reference_run_id }}
+          name: nvda-v3-frozen-reference
+          path: reference
+          github-token: ${{ secrets.JEV_PRIVATE_DATA_READ_TOKEN }}
+      - name: Verify reference fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="reference/nvda-jev-hma20-dynamic-vp-frozen-v3.csv"
+          echo "9e94c9d22dcaca7e17eab7ce40e14b6e72b8af1760b269c553a2d2c491f13c0b  $FILE" | sha256sum --check
+      - name: Compare all 2554 frozen NVDA V3 observations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python jev-v3/compare_nvda_reference.py \
+            --canonical canonical/nvda-rth-5m-2024-09-24_to_2026-09-21.csv \
+            --reference reference/nvda-jev-hma20-dynamic-vp-frozen-v3.csv \
+            --expected-rows 2554 --tolerance 1e-8
